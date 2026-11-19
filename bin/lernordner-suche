@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+lernordner-suche – search provider for GNOME search / Suchanbieter für die GNOME-Suche
+(org.gnome.Shell.SearchProvider2).
+
+Findet Notizen im Lernordner über #Tags (auch die unsichtbare Tag-Zeile), Dateinamen und
+Ordnernamen. Läuft zusätzlich zu den anderen Anbietern (Dateien, Einstellungen, …) und wird
+von D-Bus bei Bedarf gestartet; nach einigen Minuten ohne Anfrage beendet er sich wieder.
+
+Treffer antippen: Läuft Xournal++ schon, legt der Anbieter einen Auftrag ab
+(~/.local/state/lernordner/oeffnen), den das Plugin abholt (es speichert vorher die offene
+Notiz). Sonst wird Xournal++ über lernordner-start mit der Notiz gestartet.
+
+Test im Terminal:  lernordner-suche --test kardio
+"""
+import gzip
+import os
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+def _basis():
+    """Base folder: $LERNORDNER_BASIS, else lernordner.ini, else the folder set at installation."""
+    if os.environ.get("LERNORDNER_BASIS"):
+        return Path(os.environ["LERNORDNER_BASIS"])
+    import configparser
+    cfg = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "xournalpp" / "lernordner.ini"
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read(cfg, encoding="utf-8")
+        b = cp.get("lernordner", "basis", fallback="")
+        if b:
+            return Path(b).expanduser()
+    except configparser.Error:
+        pass
+    return Path("@BASIS@")
+
+
+BASIS = _basis()
+BUS_NAME = "de.lernordner.Suche"
+OBJEKT = "/de/lernordner/Suche"
+SYMBOL = "com.github.xournalpp.xournalpp"
+STATE = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "lernordner"
+STARTER = Path.home() / ".local/bin/lernordner-start"
+LEERLAUF_S = 180
+TAG_RE = re.compile(r"#([^\W\d_][\w-]*)")
+LOG = Path.home() / ".cache/lernordner-suche.log"
+
+
+def log(*teile):
+    try:
+        if LOG.exists() and LOG.stat().st_size > 200_000:
+            LOG.unlink()
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + " ".join(str(t) for t in teile) + "\n")
+    except OSError:
+        pass
+
+SCHNITTSTELLE = """
+<node>
+  <interface name="org.gnome.Shell.SearchProvider2">
+    <method name="GetInitialResultSet">
+      <arg type="as" name="terms" direction="in"/>
+      <arg type="as" name="results" direction="out"/>
+    </method>
+    <method name="GetSubsearchResultSet">
+      <arg type="as" name="previous_results" direction="in"/>
+      <arg type="as" name="terms" direction="in"/>
+      <arg type="as" name="results" direction="out"/>
+    </method>
+    <method name="GetResultMetas">
+      <arg type="as" name="identifiers" direction="in"/>
+      <arg type="aa{sv}" name="metas" direction="out"/>
+    </method>
+    <method name="ActivateResult">
+      <arg type="s" name="identifier" direction="in"/>
+      <arg type="as" name="terms" direction="in"/>
+      <arg type="u" name="timestamp" direction="in"/>
+    </method>
+    <method name="LaunchSearch">
+      <arg type="as" name="terms" direction="in"/>
+      <arg type="u" name="timestamp" direction="in"/>
+    </method>
+  </interface>
+</node>
+"""
+
+
+def falte(s):
+    return unicodedata.normalize("NFC", s).casefold()
+
+
+# ---- Index: pro Datei Tags, Name, Ordner (nach mtime zwischengespeichert) -------------
+_cache = {}   # pfad -> (mtime_ns, eintrag)
+
+
+def lies_tags(pfad: Path):
+    daten = pfad.read_bytes()
+    if daten[:2] == b"\x1f\x8b":
+        daten = gzip.decompress(daten)
+    tags = []
+    for el in ET.fromstring(daten).iter("text"):
+        for t in TAG_RE.findall(el.text or ""):
+            t = "#" + t.lower()
+            if t not in tags:
+                tags.append(t)
+    return tags
+
+
+def index():
+    erg = []
+    if not BASIS.is_dir():
+        return erg
+    gesehen = set()
+    for p in BASIS.rglob("*.xopp"):
+        teile = p.relative_to(BASIS).parts
+        if any(t.startswith(".") for t in teile) or ".autosave" in p.name:
+            continue
+        try:
+            m = p.stat().st_mtime_ns
+        except OSError:
+            continue
+        key = str(p)
+        gesehen.add(key)
+        alt = _cache.get(key)
+        if alt and alt[0] == m:
+            erg.append(alt[1])
+            continue
+        try:
+            tags = lies_tags(p)
+        except Exception:
+            tags = []
+        ordner = " / ".join(p.parent.relative_to(BASIS).parts) or p.parent.name   # mit Unterordner
+        e = {"id": key, "name": p.stem, "ordner": ordner, "tags": tags, "mtime": m,
+             "f_name": falte(p.stem), "f_ordner": falte(ordner)}
+        _cache[key] = (m, e)
+        erg.append(e)
+    for k in list(_cache):
+        if k not in gesehen:
+            del _cache[k]
+    return erg
+
+
+def passt(e, begriffe):
+    """Jeder Begriff muss passen: '#x' nur Tags (Anfang), sonst Tag-Anfang, Name oder Ordner."""
+    wert = 0
+    for b in begriffe:
+        nur_tag = b.startswith("#")
+        f = falte(b.lstrip("#"))
+        if not f:
+            continue
+        tag_treffer = [t for t in e["tags"] if t[1:].startswith(f)]
+        if tag_treffer:
+            wert += 3 if any(t[1:] == f for t in tag_treffer) else 2
+        elif not nur_tag and (f in e["f_name"] or f in e["f_ordner"]):
+            wert += 1
+        else:
+            return 0
+    return wert
+
+
+def suche(begriffe, nur=None):
+    begriffe = [b for b in begriffe if b.strip()]
+    if not begriffe or all(len(b.lstrip("#")) < 2 for b in begriffe):
+        return []
+    treffer = []
+    for e in index():
+        if nur is not None and e["id"] not in nur:
+            continue
+        w = passt(e, begriffe)
+        if w:
+            treffer.append((-w, -e["mtime"], e["id"]))
+    return [t[2] for t in sorted(treffer)]
+
+
+def oeffne(pfad):
+    laeuft = subprocess.run(["pgrep", "-x", "xournalpp"], capture_output=True).returncode == 0
+    if laeuft:
+        STATE.mkdir(parents=True, exist_ok=True)
+        tmp = STATE / ".oeffnen.tmp"
+        tmp.write_text(pfad + "\n", encoding="utf-8")
+        os.replace(tmp, STATE / "oeffnen")       # Plugin holt den Auftrag ab
+    else:
+        starter = str(STARTER) if STARTER.exists() else "xournalpp"
+        subprocess.Popen([starter, pfad], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---- D-Bus ------------------------------------------------------------------------------
+def dienst():
+    import warnings
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+
+    schleife = GLib.MainLoop()
+    letzte = [time.monotonic()]
+    symbol = Gio.ThemedIcon.new(SYMBOL).to_string()
+
+    def metas(ids):
+        nach_id = {e["id"]: e for e in index()}
+        aus = []
+        for i in ids:
+            e = nach_id.get(i)
+            if not e:
+                continue
+            beschreibung = e["ordner"] + ("  ·  " + " ".join(e["tags"]) if e["tags"] else "")
+            aus.append({"id": GLib.Variant("s", i), "name": GLib.Variant("s", e["name"]),
+                        "description": GLib.Variant("s", beschreibung),
+                        "gicon": GLib.Variant("s", symbol)})
+        return aus
+
+    def aufruf(verb, absender, pfad, schnitt, methode, param, auftrag):
+        letzte[0] = time.monotonic()
+        a = param.unpack()
+        log(methode, repr(a)[:200])
+        try:
+            if methode == "GetInitialResultSet":
+                auftrag.return_value(GLib.Variant("(as)", (suche(a[0]),)))
+            elif methode == "GetSubsearchResultSet":
+                # immer komplett neu suchen: die Shell verfeinert sonst eine leere Menge
+                # (z. B. nach dem ersten Buchstaben, für den es absichtlich keine Treffer gibt)
+                auftrag.return_value(GLib.Variant("(as)", (suche(a[1]),)))
+            elif methode == "GetResultMetas":
+                auftrag.return_value(GLib.Variant("(aa{sv})", (metas(a[0]),)))
+            elif methode == "ActivateResult":
+                oeffne(a[0])
+                auftrag.return_value(None)
+            elif methode == "LaunchSearch":
+                auftrag.return_value(None)
+            else:
+                auftrag.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", methode)
+        except Exception as e:  # noqa: BLE001
+            log("FEHLER", methode, repr(e))
+            auftrag.return_dbus_error("de.lernordner.Fehler", str(e))
+
+    info = Gio.DBusNodeInfo.new_for_xml(SCHNITTSTELLE)
+
+    def verbunden(verb, name):
+        verb.register_object(OBJEKT, info.interfaces[0], aufruf, None, None)
+        log("gestartet, Basis", BASIS)
+
+    Gio.bus_own_name(Gio.BusType.SESSION, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
+                     verbunden, None, lambda *a: schleife.quit())
+
+    def leerlauf():
+        if time.monotonic() - letzte[0] > LEERLAUF_S:
+            schleife.quit()
+            return False
+        return True
+
+    GLib.timeout_add_seconds(30, leerlauf)
+    schleife.run()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        t0 = time.monotonic()
+        ids = suche(sys.argv[2:])
+        nach_id = {e["id"]: e for e in index()}
+        for i in ids:
+            e = nach_id[i]
+            print(f"{e['ordner']} / {e['name']}   {' '.join(e['tags'])}")
+        print(f"({len(ids)} Treffer, {1000 * (time.monotonic() - t0):.0f} ms)", file=sys.stderr)
+    else:
+        dienst()

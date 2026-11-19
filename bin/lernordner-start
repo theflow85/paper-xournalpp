@@ -1,0 +1,61 @@
+#!/bin/sh
+# Launcher for Xournal++ with Lernordner (called by the .desktop file).
+#   no argument: create a new note in the inbox and open it
+#   with a .pdf:  copy it into the inbox, create a .xopp next to it, open it
+#   otherwise:    start Xournal++ as usual
+# Optional (install.sh asks): while Xournal++ runs, the Ubuntu dock is fixed in landscape and hidden
+# in portrait; the previous state is restored afterwards.
+XPP="@XPP@"
+DOCK_OPTION="@DOCK@"            # install.sh replaces this with 1 (dock handling on) or nothing
+command -v "$XPP" >/dev/null 2>&1 || XPP=xournalpp
+HELFER="${XDG_CONFIG_HOME:-$HOME/.config}/xournalpp/plugins/Lernordner/lernordner.py"
+
+# --- Only if Xournal++ is not running yet: toolbar (and dock) according to the orientation ---
+# `lernordner.py leiste` switches the study toolbar (only if it is the selected one and the rotation
+# switch in the toolbar is on) and then prints "hoch" (portrait) / "quer" (landscape), otherwise nothing.
+# The plugin follows the rotation while running (LERNORDNER_DOCK=1 allows it to switch the dock, too).
+DOCK_SCHEMA=org.gnome.shell.extensions.dash-to-dock
+DOCK_ALT=""
+if [ -f "$HELFER" ] && command -v python3 >/dev/null 2>&1 && ! pgrep -x xournalpp >/dev/null 2>&1; then
+  AUSRICHTUNG=$(python3 "$HELFER" leiste 2>>"$HOME/.cache/lernordner.log")
+  if [ "$DOCK_OPTION" = 1 ] && command -v gsettings >/dev/null 2>&1; then
+    DOCK_ALT=$(gsettings get "$DOCK_SCHEMA" dock-fixed 2>/dev/null) || DOCK_ALT=""
+    case "$DOCK_ALT" in
+      true|false)
+        export LERNORDNER_DOCK=1                 # always restore at the end, even if nothing was changed
+        case "$AUSRICHTUNG" in
+          hoch) gsettings set "$DOCK_SCHEMA" dock-fixed false 2>/dev/null ;;
+          quer) gsettings set "$DOCK_SCHEMA" dock-fixed true 2>/dev/null ;;
+        esac ;;
+      *) DOCK_ALT="" ;;
+    esac
+  fi
+fi
+dock_zurueck() {
+  [ -n "$DOCK_ALT" ] && gsettings set "$DOCK_SCHEMA" dock-fixed "$DOCK_ALT" 2>/dev/null
+  DOCK_ALT=""
+}
+
+# --- Determine the target ---
+if [ "$#" -le 1 ] && [ -f "$HELFER" ] && command -v python3 >/dev/null 2>&1; then
+  ZIEL=$(python3 "$HELFER" startziel "$@" 2>>"$HOME/.cache/lernordner.log")
+  if [ -n "$ZIEL" ] && [ -f "$ZIEL" ]; then
+    set -- "$ZIEL"
+  fi
+fi
+
+# Without dock handling: replace this process, as before
+if [ -z "$DOCK_ALT" ]; then
+  exec "$XPP" "$@"
+fi
+
+# With dock handling: run as child, forward signals, restore the dock at the end
+"$XPP" "$@" &
+PID=$!
+trap 'kill -TERM "$PID" 2>/dev/null' TERM INT HUP
+wait "$PID"
+RC=$?
+# wait returns early when a signal arrives -> wait for the real end
+while kill -0 "$PID" 2>/dev/null; do wait "$PID"; RC=$?; done
+dock_zurueck
+exit "$RC"
