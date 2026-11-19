@@ -53,8 +53,8 @@ Entwickelt unter Ubuntu mit GNOME (Wayland) auf einem Convertible mit Stift. And
 Xournal++ schließen, dann:
 
 ```bash
-git clone https://github.com/theflow85/xournalpp-lernordner.git
-cd xournalpp-lernordner
+git clone https://github.com/theflow85/paper-xournalpp.git
+cd paper-xournalpp
 bash install.sh
 ```
 

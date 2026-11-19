@@ -1,7 +1,7 @@
 # Lernordner – Xournal++-Plugin (Xournal++ 1.3.3, Ubuntu/GNOME/Wayland)
 
 Dies ist die öffentliche Version (DE/EN, Konfig ~/.config/xournalpp/lernordner.ini, CC BY-NC-SA 4.0,
-Repo theflow85/xournalpp-lernordner). Eine persönliche Variante mit festen Ordnern wird getrennt gepflegt;
+Repo theflow85/paper-xournalpp). Eine persönliche Variante mit festen Ordnern wird getrennt gepflegt;
 Änderungen daraus werden von Hand nachgezogen.
 
 ## Aufbau

@@ -1,5 +1,5 @@
 -- Lernordner – Xournal++ plugin (written against the 1.3.3 API) · CC BY-NC-SA 4.0
--- https://github.com/theflow85/xournalpp-lernordner
+-- https://github.com/theflow85/paper-xournalpp
 --
 -- Grundsatz: Jede Notiz hat von Anfang an einen Dateipfad, damit Xournal++
 -- nie den Speicherdialog zeigt. Dialoge (zenity) und Dateiarbeit erledigt
